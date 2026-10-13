@@ -4,9 +4,13 @@
 """Vortexa 免费主机自动续期。
 
 登录 api.vortexa.cloud 并上报免费服务的活跃度，满足「2 天内活跃一次」的续期要求。
+
+支持单个 VORTEXA_EMAIL / VORTEXA_PASSWORD，以及 VORTEXA_1..VORTEXA_5
+（格式 邮箱-----密码）。第二个及之后的账号会先重启 WARP 换 IP。
 """
 
 import os
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -25,6 +29,9 @@ USER_AGENT = (
 )
 # 出口由 CI 的 WARP 接管（fscarmen/warp-on-actions，mode=client，stack=dual，
 # warp+doh）。脚本直连，不设置 HTTP/SOCKS 代理。
+# 多账号时，从第二个账号起按 Wispbyte 的方式重启 WARP 注册以更换出口 IP。
+ACCOUNT_SLOTS = range(1, 6)
+ACCOUNT_SEPARATOR = "-----"
 
 
 @dataclass
@@ -264,19 +271,100 @@ def renew(session: requests.Session, token: str) -> dict:
     }
 
 
-def main(argv=None) -> int:
-    """入口：返回进程退出码（成功 0，失败非 0）。"""
-    print("#" * 25)
-    print("   Vortexa 免费主机自动续期")
-    print("#" * 25)
+def parse_account_secret(raw: str) -> Optional[tuple]:
+    """解析 `邮箱-----密码`。密码里可以再包含同样的分隔符。"""
+    email, sep, password = (raw or "").partition(ACCOUNT_SEPARATOR)
+    if not sep:
+        return None
+    email, password = email.strip(), password.strip()
+    if not email or not password:
+        return None
+    return email, password
 
-    config = load_config(os.environ)
-    if config is None:
-        print("❌ 缺少 VORTEXA_EMAIL 或 VORTEXA_PASSWORD 环境变量")
-        return 1
 
+def load_accounts(env: Mapping[str, str]) -> list:
+    """收集要续期的账号。先取旧的邮箱/密码，再取 VORTEXA_1..5。同一邮箱只保留一次。"""
+    tg_bot_token = env.get("TG_BOT_TOKEN") or ""
+    tg_chat_id = env.get("TG_CHAT_ID") or ""
+    accounts = []
+    seen = set()
+
+    def add(email: str, password: str, label: str) -> None:
+        key = email.lower()
+        if key in seen:
+            print(f"ℹ️ 跳过重复账号 {label}: {mask_email(email)}")
+            return
+        seen.add(key)
+        accounts.append(Config(email, password, tg_bot_token, tg_chat_id))
+        print(f"📋 已加载 {label}: {mask_email(email)}")
+
+    legacy = load_config(env)
+    if legacy is not None:
+        add(legacy.email, legacy.password, "VORTEXA_EMAIL")
+
+    for slot in ACCOUNT_SLOTS:
+        label = f"VORTEXA_{slot}"
+        raw = (env.get(label) or "").strip()
+        if not raw:
+            continue
+        parsed = parse_account_secret(raw)
+        if parsed is None:
+            print(f"⚠️ {label} 格式错误，期望 邮箱-----密码")
+            continue
+        add(parsed[0], parsed[1], label)
+    return accounts
+
+
+def restart_warp() -> bool:
+    """断开并重新注册 WARP，换一个出口 IP。步骤与 Wispbyte 的 restart_warp 相同。"""
+    print("🔁 正在重启 WARP 以更换 IP...")
+    try:
+        old_ip = requests.get("https://api.ipify.org", timeout=10).text.strip()
+        print(f"当前 IP: {old_ip}")
+    except Exception:
+        print("当前 IP: 未知")
+    try:
+        subprocess.run(
+            ["sudo", "warp-cli", "--accept-tos", "disconnect"],
+            check=False,
+            timeout=30,
+            capture_output=True,
+        )
+        time.sleep(3)
+        try:
+            subprocess.run(
+                ["sudo", "warp-cli", "--accept-tos", "registration", "delete"],
+                check=True,
+                timeout=30,
+                capture_output=True,
+            )
+        except subprocess.CalledProcessError:
+            print("⚠️ 删除 WARP 注册失败（可能未注册），继续...")
+        subprocess.run(
+            ["sudo", "warp-cli", "--accept-tos", "registration", "new"],
+            check=True,
+            timeout=30,
+            capture_output=True,
+        )
+        time.sleep(3)
+        subprocess.run(
+            ["sudo", "warp-cli", "--accept-tos", "connect"],
+            check=True,
+            timeout=30,
+            capture_output=True,
+        )
+        time.sleep(10)
+        new_ip = requests.get("https://api.ipify.org", timeout=10).text.strip()
+        print(f"✅ WARP 重连成功，新 IP: {new_ip}")
+        return True
+    except Exception as exc:
+        print(f"❌ WARP 重连失败: {type(exc).__name__}")
+        return False
+
+
+def run_account(config: Config) -> int:
+    """续期一个账号。成功或没有免费服务返回 0，失败返回 1。"""
     print(f"👤 登录账户: {mask_email(config.email)}")
-
     session = build_session()
 
     token, error = login(session, config.email, config.password)
@@ -311,6 +399,31 @@ def main(argv=None) -> int:
     print(f"❌ 续期失败: {result.get('error')}")
     send_tg_message(config, "❌", "续期失败", f"错误: {result.get('error')}")
     return 1
+
+
+def main(argv=None) -> int:
+    """入口：返回进程退出码（任一账号失败，或换 IP 失败，均为非 0）。"""
+    print("#" * 25)
+    print("   Vortexa 免费主机自动续期")
+    print("#" * 25)
+
+    accounts = load_accounts(os.environ)
+    if not accounts:
+        print("❌ 缺少账号：设置 VORTEXA_EMAIL / VORTEXA_PASSWORD，或 VORTEXA_1..VORTEXA_5")
+        return 1
+
+    failed = False
+    for index, config in enumerate(accounts):
+        if index:
+            print(f"🔁 切换到第 {index + 1}/{len(accounts)} 个账号，先更换 WARP IP")
+            if not restart_warp():
+                print("❌ WARP 换 IP 失败，停止后续账号，避免同一 IP 登录多个账户")
+                return 1
+        elif len(accounts) > 1:
+            print(f"▶️ 第 {index + 1}/{len(accounts)} 个账号")
+        if run_account(config) != 0:
+            failed = True
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
