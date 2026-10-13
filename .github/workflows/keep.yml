@@ -36,6 +36,11 @@ jobs:
         env:
           VORTEXA_EMAIL: ${{ secrets.VORTEXA_EMAIL }}
           VORTEXA_PASSWORD: ${{ secrets.VORTEXA_PASSWORD }}
+          VORTEXA_1: ${{ secrets.VORTEXA_1 }}
+          VORTEXA_2: ${{ secrets.VORTEXA_2 }}
+          VORTEXA_3: ${{ secrets.VORTEXA_3 }}
+          VORTEXA_4: ${{ secrets.VORTEXA_4 }}
+          VORTEXA_5: ${{ secrets.VORTEXA_5 }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
